@@ -21,7 +21,7 @@ workdir <- "/Users/.../study_1/08-MaasLin2"
 
 # Input files
 infile_data     <- "Maaslin_data_ASV_input.txt"       # feature table (samples x taxa or taxa x samples)
-infile_metadata <- "study_1_metadata_4_including_sample_removed.txt"  # sample metadata
+infile_metadata <- "study_1_metadata_4.txt"  # sample metadata
 
 # Metadata column names. Must match the metadata file header exactly.
 outcome_var  <- "MRI_Score"    # continuous outcome
@@ -39,7 +39,7 @@ max_sig       <- 0.05    # q-value threshold for significance
 min_prev      <- 0.33    # minimum sample prevalence to retain a feature (33%)
 
 # Output directory. Name encodes the key model choices for traceability.
-outdir <- "251108_ASV_MRI_Score_genus_cov_Age_DD_Weight_Hypertension_MinPrev33pct"
+outdir <- "251108_ASV_MRI_Score_cov_Age_DD_Weight_Hypertension_MinPrev33pct"
 
 
 # -- 3. Derived settings -------------------------------------

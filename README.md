@@ -1,5 +1,5 @@
 # microbiome_analysis
-Analysis scripts for 16S rRNA gut microbiome research in a disease cohort.
+Analysis scripts for 16S rRNA gut microbiome research.
 Scripts folder contains the following:
 1) QIIME2 workflow (Denoising, taxonomy, filtering, alpha/beta diversity)
 2) MaAsLin2 (Taxa–MRI score association testing)

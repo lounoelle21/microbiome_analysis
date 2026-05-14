@@ -1,0 +1,492 @@
+# ============================================================
+# Title:   QIIME2 16S Amplicon Workflow
+# Author:  Lou Langhammer
+# Env:     qiime2-amplicon-2024.10
+# Purpose: Full amplicon processing pipeline for study_1:
+#          import → DADA2 denoising → SILVA taxonomic
+#          classification → multi-step feature-table filtering
+#          → phylogenetic tree → alpha / beta diversity.
+#          Two parallel feature tables are carried through the
+#          diversity steps: a primary filtered table and a
+#          combo table with outlier sample 26-02 excluded.
+# ============================================================
+ 
+set -euo pipefail
+ 
+ 
+# -- 1. Environment ------------------------------------------
+ 
+# Activate the QIIME2 conda environment.
+# If conda is not shell-initialised (e.g. when running as a
+# non-interactive script), uncomment the line below and adjust
+# the path to match your miniconda / anaconda installation:
+# source "$HOME/miniconda3/etc/profile.d/conda.sh"
+ 
+conda activate qiime2-amplicon-2024.10
+ 
+ 
+# -- 2. User settings ----------------------------------------
+ 
+# Project root. All relative paths below resolve from here.
+# Adjust before running; do not leave as the placeholder.
+PROJECT_DIR="/Users/..."
+ 
+# Raw data and sample metadata
+RAW_DIR="01-raw/gzip"                                            # directory of gzipped FASTQ files
+MANIFEST="manifest_study_1_.txt"                                 # paired-end manifest (Phred33 V2 format)
+METADATA="metadata_study_1_.txt"                                 # full sample metadata
+METADATA_CLEAN="metadata_study_1__clean_sample_removed_MRI.txt"  # metadata with outlier sample removed
+ 
+# SILVA 138 reference files (copied from NASA project;
+# the QIIME2 data-resource URL for these returned 404).
+SILVA_DIR="Silva"
+SILVA_SEQS="${SILVA_DIR}/silva-138-99-seqs.qza"    # full-length SILVA sequences
+SILVA_TAX="${SILVA_DIR}/silva-138-99-tax.qza"       # corresponding taxonomy
+SILVA_V45_READS="${SILVA_DIR}/ref-seqs-V45.qza"     # primer-trimmed reference reads (generated below)
+SILVA_V45_CLASSIFIER="${SILVA_DIR}/classifier-Silva-138-99-V45.qza"  # trained classifier (generated below)
+ 
+# Primer sequences for the V4-V5 region (515F / 926R).
+PRIMER_F="GTGCCAGCMGCCGCGGTAA"
+PRIMER_R="CCGYCAATTYMTTTRAGTTT"
+ 
+# DADA2 truncation and quality parameters.
+# Reverse truncation was raised from 200 to 220 because merged-read
+# percentage was low (50-70%). Chimera fold threshold was raised from
+# 1 to 1.5 because chimera rate was high (~80%). These adjustments
+# reduced input-passing-filter from 56-70% to 52-68% and merged reads
+# from 56-67% to 51-67%, but raised non-chimeric input from 10-26%
+# to 27-44%, which is the primary quality concern.
+TRIM_LEFT_F=7      # forward primer bases to trim from the 5' end
+TRIM_LEFT_R=7      # reverse primer bases to trim from the 5' end
+TRUNC_LEN_F=280    # forward read truncation length
+TRUNC_LEN_R=220    # reverse read truncation length
+MIN_FOLD=1.5       # min fold-change over parent for chimera detection
+ 
+# SILVA primer extraction length bounds.
+# Spans the expected amplicon length for V4-V5 with some tolerance.
+REF_MIN_LEN=300
+REF_MAX_LEN=500
+ 
+# Feature-table filtering thresholds (applied sequentially).
+MIN_FEATURE_FREQ=10    # minimum total read count across all samples per ASV
+MIN_SAMPLES=2          # minimum number of samples an ASV must appear in
+MIN_SAMPLE_FREQ=1000   # minimum total read count per sample
+ 
+# Diversity rarefaction depth.
+# Set to the minimum sample frequency retained after filtering (see above).
+SAMPLING_DEPTH=1000
+ 
+# Run date tag appended to all output file names.
+DATE_TAG="251108"
+ 
+# Outlier sample to exclude in the combo-table analyses.
+EXCL_SAMPLE="26-02"
+ 
+ 
+# -- 3. Derived paths ----------------------------------------
+ 
+cd "$PROJECT_DIR"
+ 
+mkdir -p \
+  02-demultiplex \
+  03-features \
+  04-alignment \
+  05-alpha_"${DATE_TAG}" \
+  05-alpha-combo_"${DATE_TAG}" \
+  06-beta-"${SAMPLING_DEPTH}"_"${DATE_TAG}" \
+  06-beta-combo-"${SAMPLING_DEPTH}"_"${DATE_TAG}" \
+  07-taxa \
+  10-RelativeFrequency
+ 
+# Convenience shorthands used repeatedly below
+FEAT="03-features"
+ALIGN="04-alignment"
+TAXA="07-taxa"
+ALPHA="05-alpha_${DATE_TAG}"
+ALPHA_C="05-alpha-combo_${DATE_TAG}"
+BETA="06-beta-${SAMPLING_DEPTH}_${DATE_TAG}"
+BETA_C="06-beta-combo-${SAMPLING_DEPTH}_${DATE_TAG}"
+ 
+ 
+# -- 4. Raw sequence inventory and import --------------------
+ 
+# Record compressed filenames before any processing.
+# Useful for NCBI SRA submission later.
+find "$RAW_DIR" -maxdepth 1 -type f -name "*.gz" -exec basename {} \; \
+  | sort > "rawfilenames_study_1_.txt"
+ 
+# Import paired-end sequences directly from gzipped FASTQ files.
+# QIIME2 handles .gz natively; decompressing first is unnecessary.
+qiime tools import \
+  --type 'SampleData[PairedEndSequencesWithQuality]' \
+  --input-path  "$MANIFEST" \
+  --output-path "${FEAT}/demux-paired-end-study_1_.qza" \
+  --input-format PairedEndFastqManifestPhred33V2
+ 
+# Visualise per-sample read counts and quality scores.
+# Inspect this QZV to confirm truncation lengths are appropriate.
+qiime demux summarize \
+  --i-data     "${FEAT}/demux-paired-end-study_1_.qza" \
+  --o-visualization "02-demultiplex/demux-summary-study_1_.qzv"
+ 
+ 
+# -- 5. Denoising with DADA2 ---------------------------------
+ 
+# Denoise paired-end reads, infer ASVs, and remove chimeras.
+# Parameter choices are documented in the user settings above.
+qiime dada2 denoise-paired \
+  --p-trim-left-f                  "$TRIM_LEFT_F" \
+  --p-trim-left-r                  "$TRIM_LEFT_R" \
+  --p-trunc-len-f                  "$TRUNC_LEN_F" \
+  --p-trunc-len-r                  "$TRUNC_LEN_R" \
+  --p-min-fold-parent-over-abundance "$MIN_FOLD" \
+  --i-demultiplexed-seqs           "${FEAT}/demux-paired-end-study_1_.qza" \
+  --o-representative-sequences     "${FEAT}/0-unfiltered-rep-seqs-study_1__${DATE_TAG}.qza" \
+  --o-table                        "${FEAT}/0-unfiltered-table-study_1__${DATE_TAG}.qza" \
+  --o-denoising-stats              "${FEAT}/0-denoising-stats-study_1__${DATE_TAG}.qza"
+ 
+# Summarize raw feature table.
+qiime feature-table summarize \
+  --i-table                "${FEAT}/0-unfiltered-table-study_1__${DATE_TAG}.qza" \
+  --o-visualization        "${FEAT}/0-unfiltered-table-study_1__${DATE_TAG}.qzv" \
+  --m-sample-metadata-file "$METADATA"
+ 
+# Tabulate representative sequences.
+qiime feature-table tabulate-seqs \
+  --i-data          "${FEAT}/0-unfiltered-rep-seqs-study_1__${DATE_TAG}.qza" \
+  --o-visualization "${FEAT}/0-unfiltered-rep-seqs-study_1__${DATE_TAG}.qzv"
+ 
+# Tabulate per-sample denoising statistics.
+# Check passing-filter, merged, and non-chimeric percentages here.
+qiime metadata tabulate \
+  --m-input-file    "${FEAT}/0-denoising-stats-study_1__${DATE_TAG}.qza" \
+  --o-visualization "${FEAT}/0-denoising-stats-study_1__${DATE_TAG}.qzv"
+ 
+ 
+# -- 6. Train SILVA classifier for the V4-V5 region ---------
+ 
+# Extract the amplicon region from full-length SILVA sequences.
+# Length bounds (300-500 bp) accommodate typical V4-V5 product sizes.
+qiime feature-classifier extract-reads \
+  --i-sequences "$SILVA_SEQS" \
+  --p-f-primer  "$PRIMER_F" \
+  --p-r-primer  "$PRIMER_R" \
+  --p-min-length "$REF_MIN_LEN" \
+  --p-max-length "$REF_MAX_LEN" \
+  --o-reads      "$SILVA_V45_READS"
+ 
+# Visualise trimmed reference sequences to confirm extraction worked.
+qiime feature-table tabulate-seqs \
+  --i-data          "$SILVA_V45_READS" \
+  --o-visualization "${SILVA_DIR}/ref-seqs-V45.qzv"
+ 
+# Fit a naive Bayes classifier on the primer-trimmed reference sequences.
+# This step is slow; the classifier artifact can be reused across runs.
+qiime feature-classifier fit-classifier-naive-bayes \
+  --i-reference-reads    "$SILVA_V45_READS" \
+  --i-reference-taxonomy "$SILVA_TAX" \
+  --o-classifier         "$SILVA_V45_CLASSIFIER"
+ 
+ 
+# -- 7. Taxonomic classification -----------------------------
+ 
+# Classify ASVs against the trained V4-V5 SILVA classifier.
+qiime feature-classifier classify-sklearn \
+  --i-classifier    "$SILVA_V45_CLASSIFIER" \
+  --i-reads         "${FEAT}/0-unfiltered-rep-seqs-study_1__${DATE_TAG}.qza" \
+  --o-classification "${TAXA}/taxonomy-study_1__${DATE_TAG}.qza"
+ 
+# Tabulate taxonomy assignments for manual inspection.
+qiime metadata tabulate \
+  --m-input-file    "${TAXA}/taxonomy-study_1__${DATE_TAG}.qza" \
+  --o-visualization "${TAXA}/taxonomy-study_1__${DATE_TAG}.qzv"
+ 
+# Taxa barplot on the unfiltered table; useful as a before/after reference.
+qiime taxa barplot \
+  --i-table         "${FEAT}/0-unfiltered-table-study_1__${DATE_TAG}.qza" \
+  --i-taxonomy      "${TAXA}/taxonomy-study_1__${DATE_TAG}.qza" \
+  --m-metadata-file "$METADATA" \
+  --o-visualization "${TAXA}/unfiltered-taxa-bar-plots-study_1__${DATE_TAG}.qzv"
+ 
+ 
+# -- 8. Feature-table filtering ------------------------------
+# Filters are applied sequentially. Table dimensions are recorded
+# after each step and combined at the end for a single audit file.
+ 
+# Step 1: retain only samples flagged Keep='Yes' in metadata.
+#         This removes blanks, controls, and non-target sample types.
+qiime feature-table filter-samples \
+  --i-table         "${FEAT}/0-unfiltered-table-study_1__${DATE_TAG}.qza" \
+  --m-metadata-file "$METADATA" \
+  --p-where         "Keep='Yes'" \
+  --o-filtered-table "${FEAT}/1-Keep-table-study_1__${DATE_TAG}.qza"
+ 
+qiime feature-table summarize \
+  --i-table                "${FEAT}/1-Keep-table-study_1__${DATE_TAG}.qza" \
+  --o-visualization        "${FEAT}/1-Keep-table-study_1__${DATE_TAG}.qzv" \
+  --m-sample-metadata-file "$METADATA"
+ 
+# Step 2 (number 3 in file names for historical continuity):
+#         remove ASVs assigned to mitochondria, chloroplast, or
+#         contaminant genera (Halomonas, Mycoplasma_weyonii,
+#         Candidatus_Mycoplasma). Also require a phylum-level
+#         assignment (p__) to exclude fully unclassified ASVs.
+qiime taxa filter-table \
+  --i-table      "${FEAT}/1-Keep-table-study_1__${DATE_TAG}.qza" \
+  --i-taxonomy   "${TAXA}/taxonomy-study_1__${DATE_TAG}.qza" \
+  --p-exclude    mitochondria,chloroplast,Halomonas,Mycoplasma_weyonii,Candidatus_Mycoplasma \
+  --p-include    p__ \
+  --o-filtered-table "${FEAT}/3-Filtered-study_1_-NoUnassignedTaxonomy_${DATE_TAG}.qza"
+ 
+qiime feature-table summarize \
+  --i-table                "${FEAT}/3-Filtered-study_1_-NoUnassignedTaxonomy_${DATE_TAG}.qza" \
+  --o-visualization        "${FEAT}/3-Filtered-study_1_-NoUnassignedTaxonomy_${DATE_TAG}.qzv" \
+  --m-sample-metadata-file "$METADATA"
+ 
+# Step 3: remove ASVs with fewer than MIN_FEATURE_FREQ reads
+#         summed across all samples; reduces noise from rare artefacts.
+qiime feature-table filter-features \
+  --i-table          "${FEAT}/3-Filtered-study_1_-NoUnassignedTaxonomy_${DATE_TAG}.qza" \
+  --p-min-frequency  "$MIN_FEATURE_FREQ" \
+  --o-filtered-table "${FEAT}/4-Filtered-study_1_-Min10seq_${DATE_TAG}.qza"
+ 
+qiime feature-table summarize \
+  --i-table                "${FEAT}/4-Filtered-study_1_-Min10seq_${DATE_TAG}.qza" \
+  --o-visualization        "${FEAT}/4-Filtered-study_1_-Min10seq_${DATE_TAG}.qzv" \
+  --m-sample-metadata-file "$METADATA"
+ 
+# Step 4: remove ASVs present in fewer than MIN_SAMPLES samples;
+#         retains only features observed in at least two samples.
+qiime feature-table filter-features \
+  --i-table          "${FEAT}/4-Filtered-study_1_-Min10seq_${DATE_TAG}.qza" \
+  --p-min-samples    "$MIN_SAMPLES" \
+  --o-filtered-table "${FEAT}/5-Filtered-study_1_-AtLeastInTwoSamples_${DATE_TAG}.qza"
+ 
+qiime feature-table summarize \
+  --i-table                "${FEAT}/5-Filtered-study_1_-AtLeastInTwoSamples_${DATE_TAG}.qza" \
+  --o-visualization        "${FEAT}/5-Filtered-study_1_-AtLeastInTwoSamples_${DATE_TAG}.qzv" \
+  --m-sample-metadata-file "$METADATA"
+ 
+# Step 5: remove samples with fewer than MIN_SAMPLE_FREQ total reads;
+#         aligns the minimum library size with the rarefaction depth.
+qiime feature-table filter-samples \
+  --i-table          "${FEAT}/5-Filtered-study_1_-AtLeastInTwoSamples_${DATE_TAG}.qza" \
+  --p-min-frequency  "$MIN_SAMPLE_FREQ" \
+  --o-filtered-table "${FEAT}/6-Filtered-study_1_-Above1000_${DATE_TAG}.qza"
+ 
+qiime feature-table summarize \
+  --i-table                "${FEAT}/6-Filtered-study_1_-Above1000_${DATE_TAG}.qza" \
+  --o-visualization        "${FEAT}/6-Filtered-study_1_-Above1000_${DATE_TAG}.qzv" \
+  --m-sample-metadata-file "$METADATA"
+ 
+# Create a clean alias for the final filtered table used downstream.
+cp "${FEAT}/6-Filtered-study_1_-Above1000_${DATE_TAG}.qza" \
+   "${FEAT}/Filtered-table-study_1__${DATE_TAG}.qza"
+ 
+qiime feature-table summarize \
+  --i-table                "${FEAT}/Filtered-table-study_1__${DATE_TAG}.qza" \
+  --o-visualization        "${FEAT}/Filtered-table-study_1__${DATE_TAG}.qzv" \
+  --m-sample-metadata-file "$METADATA"
+ 
+# Record table dimensions after each filtering step, then combine into
+# a single audit file for quick review of sample/feature attrition.
+qiime tools inspect-metadata \
+  "${FEAT}/1-Keep-table-study_1__${DATE_TAG}.qza" \
+  > "${FEAT}/dimensions_1-Keep-table_${DATE_TAG}.txt"
+ 
+qiime tools inspect-metadata \
+  "${FEAT}/3-Filtered-study_1_-NoUnassignedTaxonomy_${DATE_TAG}.qza" \
+  > "${FEAT}/dimensions_3-Filtered-study_1_-NoUnassignedTaxonomy_${DATE_TAG}.txt"
+ 
+qiime tools inspect-metadata \
+  "${FEAT}/4-Filtered-study_1_-Min10seq_${DATE_TAG}.qza" \
+  > "${FEAT}/dimensions_4-Filtered-study_1_-Min10seq_${DATE_TAG}.txt"
+ 
+qiime tools inspect-metadata \
+  "${FEAT}/5-Filtered-study_1_-AtLeastInTwoSamples_${DATE_TAG}.qza" \
+  > "${FEAT}/dimensions_5-Filtered-study_1_-AtLeastInTwoSamples_${DATE_TAG}.txt"
+ 
+qiime tools inspect-metadata \
+  "${FEAT}/6-Filtered-study_1_-Above1000_${DATE_TAG}.qza" \
+  > "${FEAT}/dimensions_6-Filtered-study_1_-Above1000_${DATE_TAG}.txt"
+ 
+tail -n 2 "${FEAT}"/dimensions_*_"${DATE_TAG}".txt \
+  > "${FEAT}/dimensions_${DATE_TAG}.txt"
+ 
+ 
+# -- 9. Taxa barplots and filtered representative sequences --
+ 
+# Taxa barplot on the primary filtered table.
+qiime taxa barplot \
+  --i-table         "${FEAT}/Filtered-table-study_1__${DATE_TAG}.qza" \
+  --i-taxonomy      "${TAXA}/taxonomy-study_1__${DATE_TAG}.qza" \
+  --m-metadata-file "$METADATA_CLEAN" \
+  --o-visualization "${TAXA}/filtered-taxa-bar-plots-study_1__${DATE_TAG}.qzv"
+ 
+# Subset representative sequences to match the filtered feature table;
+# ensures the tree in section 10 is built only from retained ASVs.
+qiime feature-table filter-seqs \
+  --i-data          "${FEAT}/0-unfiltered-rep-seqs-study_1__${DATE_TAG}.qza" \
+  --i-table         "${FEAT}/Filtered-table-study_1__${DATE_TAG}.qza" \
+  --o-filtered-data "${FEAT}/Filtered-rep-seqs-study_1__${DATE_TAG}.qza"
+ 
+qiime feature-table tabulate-seqs \
+  --i-data          "${FEAT}/Filtered-rep-seqs-study_1__${DATE_TAG}.qza" \
+  --o-visualization "${FEAT}/Filtered-rep-seqs-study_1__${DATE_TAG}.qzv"
+ 
+# Combo table version (EXCL-${EXCL_SAMPLE}):
+# Requires the combo feature table to exist at the path below.
+# This table is produced separately by removing the outlier sample.
+qiime taxa barplot \
+  --i-table         "${FEAT}/Filtered-table-study_1__${DATE_TAG}_EXCL-${EXCL_SAMPLE}.qza" \
+  --i-taxonomy      "${TAXA}/taxonomy-study_1__${DATE_TAG}.qza" \
+  --m-metadata-file "$METADATA_CLEAN" \
+  --o-visualization "${TAXA}/filtered-taxa-bar-plots-study_1__${DATE_TAG}_EXCL-${EXCL_SAMPLE}.qzv"
+ 
+qiime feature-table filter-seqs \
+  --i-data          "${FEAT}/0-unfiltered-rep-seqs-study_1__${DATE_TAG}.qza" \
+  --i-table         "${FEAT}/Filtered-table-study_1__${DATE_TAG}_EXCL-${EXCL_SAMPLE}.qza" \
+  --o-filtered-data "${FEAT}/Filtered-rep-seqs-study_1__${DATE_TAG}_EXCL-${EXCL_SAMPLE}.qza"
+ 
+qiime feature-table tabulate-seqs \
+  --i-data          "${FEAT}/Filtered-rep-seqs-study_1__${DATE_TAG}_EXCL-${EXCL_SAMPLE}.qza" \
+  --o-visualization "${FEAT}/Filtered-rep-seqs-study_1__${DATE_TAG}_EXCL-${EXCL_SAMPLE}.qzv"
+ 
+ 
+# -- 10. Phylogenetic tree -----------------------------------
+# Built once from the primary filtered representative sequences;
+# reused for both the primary and combo diversity analyses because
+# the ASV set is identical between the two tables.
+ 
+# Align representative sequences with MAFFT.
+qiime alignment mafft \
+  --i-sequences  "${FEAT}/Filtered-rep-seqs-study_1__${DATE_TAG}.qza" \
+  --o-alignment  "${ALIGN}/aligned-rep-seqs-study_1__${DATE_TAG}.qza"
+ 
+# Mask hypervariable alignment positions to reduce phylogenetic noise.
+qiime alignment mask \
+  --i-alignment   "${ALIGN}/aligned-rep-seqs-study_1__${DATE_TAG}.qza" \
+  --o-masked-alignment "${ALIGN}/masked-aligned-rep-seqs-study_1__${DATE_TAG}.qza"
+ 
+# Infer an unrooted tree with FastTree.
+qiime phylogeny fasttree \
+  --i-alignment "${ALIGN}/masked-aligned-rep-seqs-study_1__${DATE_TAG}.qza" \
+  --o-tree      "${ALIGN}/unrooted-tree-study_1__${DATE_TAG}.qza"
+ 
+# Root the tree at its midpoint for UniFrac calculations.
+qiime phylogeny midpoint-root \
+  --i-tree      "${ALIGN}/unrooted-tree-study_1__${DATE_TAG}.qza" \
+  --o-rooted-tree "${ALIGN}/rooted-tree-study_1__${DATE_TAG}.qza"
+ 
+ 
+# -- 11. Beta diversity: primary filtered table --------------
+ 
+# Compute phylogenetic and non-phylogenetic core diversity metrics.
+# Rarefaction depth matches MIN_SAMPLE_FREQ from section 8 step 5.
+qiime diversity core-metrics-phylogenetic \
+  --i-phylogeny      "${ALIGN}/rooted-tree-study_1__${DATE_TAG}.qza" \
+  --i-table          "${FEAT}/Filtered-table-study_1__${DATE_TAG}.qza" \
+  --p-sampling-depth "$SAMPLING_DEPTH" \
+  --m-metadata-file  "$METADATA_CLEAN" \
+  --output-dir       "$BETA"
+ 
+# Move alpha-diversity vector artifacts to a dedicated directory;
+# core-metrics writes them into the beta output folder by default.
+mv "${BETA}"/*vector* "${ALPHA}/"
+ 
+# Test beta-diversity group differences by MRI status (PERMANOVA).
+qiime diversity beta-group-significance \
+  --i-distance-matrix  "${BETA}/unweighted_unifrac_distance_matrix.qza" \
+  --m-metadata-file    "$METADATA_CLEAN" \
+  --m-metadata-column  MRI \
+  --o-visualization    "${BETA}/unweighted-unifrac-MRI-significance_${DATE_TAG}.qzv" \
+  --p-pairwise
+ 
+ 
+# -- 12. Beta diversity: combo table (EXCL-26-02) ------------
+ 
+# Same phylogeny is reused; only the feature table differs.
+qiime diversity core-metrics-phylogenetic \
+  --i-phylogeny      "${ALIGN}/rooted-tree-study_1__${DATE_TAG}.qza" \
+  --i-table          "${FEAT}/Filtered-table-study_1__${DATE_TAG}_EXCL-${EXCL_SAMPLE}.qza" \
+  --p-sampling-depth "$SAMPLING_DEPTH" \
+  --m-metadata-file  "$METADATA_CLEAN" \
+  --output-dir       "$BETA_C"
+ 
+mv "${BETA_C}"/*vector* "${ALPHA_C}/"
+ 
+# Unadjusted test of beta-diversity differences by MRI status (PERMANOVA).
+# beta-group-significance tests a single grouping column and cannot model
+# covariates; multi-predictor tests are handled by ADONIS in section 13.
+qiime diversity beta-group-significance \
+  --i-distance-matrix  "${BETA_C}/unweighted_unifrac_distance_matrix.qza" \
+  --m-metadata-file    "$METADATA_CLEAN" \
+  --m-metadata-column  MRI \
+  --o-visualization    "${BETA_C}/unweighted-unifrac-MRI-significance_${DATE_TAG}.qzv" \
+  --p-pairwise
+ 
+ 
+# -- 13. ADONIS (PERMANOVA) tests: combo table ---------------
+# ADONIS partitions beta-diversity variance among multiple predictors
+# simultaneously, unlike the pairwise tests above.
+ 
+# Model 1: MRI status and disease duration.
+qiime diversity adonis \
+  --i-distance-matrix  "${BETA_C}/weighted_unifrac_distance_matrix.qza" \
+  --m-metadata-file    "$METADATA_CLEAN" \
+  --p-formula          "MRI+DD" \
+  --o-visualization    "${BETA_C}/weighted-adonis-MRI-DD_${DATE_TAG}.qzv"
+ 
+# Model 2: MRI status, age group, and disease duration.
+qiime diversity adonis \
+  --i-distance-matrix  "${BETA_C}/weighted_unifrac_distance_matrix.qza" \
+  --m-metadata-file    "$METADATA_CLEAN" \
+  --p-formula          "MRI+age_group+DD" \
+  --o-visualization    "${BETA_C}/weighted-adonis-MRI-age_group-DD_${DATE_TAG}.qzv"
+ 
+ 
+# -- 14. Alpha diversity: combo table ------------------------
+ 
+# Rarefaction curve to confirm SAMPLING_DEPTH is in the plateau region.
+qiime diversity alpha-rarefaction \
+  --i-table         "${FEAT}/Filtered-table-study_1__${DATE_TAG}_EXCL-${EXCL_SAMPLE}.qza" \
+  --i-phylogeny     "${ALIGN}/rooted-tree-study_1__${DATE_TAG}.qza" \
+  --p-max-depth     "$SAMPLING_DEPTH" \
+  --m-metadata-file "$METADATA_CLEAN" \
+  --o-visualization "${ALPHA_C}/alpha-rarefaction-study_1_.qzv"
+ 
+# Group significance tests for each alpha-diversity metric by MRI status.
+ 
+# Faith's phylogenetic diversity: accounts for phylogenetic breadth.
+qiime diversity alpha-group-significance \
+  --i-alpha-diversity "${ALPHA_C}/faith_pd_vector.qza" \
+  --m-metadata-file   "$METADATA_CLEAN" \
+  --o-visualization   "${ALPHA_C}/faith-pd-group-significance.qzv"
+ 
+# Pielou's evenness: how uniformly reads are distributed across ASVs.
+qiime diversity alpha-group-significance \
+  --i-alpha-diversity "${ALPHA_C}/evenness_vector.qza" \
+  --m-metadata-file   "$METADATA_CLEAN" \
+  --o-visualization   "${ALPHA_C}/evenness-group-significance.qzv"
+ 
+# Observed features: raw ASV richness.
+qiime diversity alpha-group-significance \
+  --i-alpha-diversity "${ALPHA_C}/observed_features_vector.qza" \
+  --m-metadata-file   "$METADATA_CLEAN" \
+  --o-visualization   "${ALPHA_C}/observed-features-group-significance.qzv"
+ 
+# Shannon entropy: richness weighted by relative abundance.
+qiime diversity alpha-group-significance \
+  --i-alpha-diversity "${ALPHA_C}/shannon_vector.qza" \
+  --m-metadata-file   "$METADATA_CLEAN" \
+  --o-visualization   "${ALPHA_C}/shannon-group-significance.qzv"
+ 
+ 
+# -- 15. Open key visualizations -----------------------------
+# Opens QZV files in QIIME2 View; download TSV tables from there as needed.
+ 
+qiime tools view "${ALPHA_C}/alpha-rarefaction-study_1_.qzv"
+qiime tools view "${ALPHA_C}/faith-pd-group-significance.qzv"
+qiime tools view "${ALPHA_C}/evenness-group-significance.qzv"
+qiime tools view "${ALPHA_C}/observed-features-group-significance.qzv"
+qiime tools view "${ALPHA_C}/shannon-group-significance.qzv"

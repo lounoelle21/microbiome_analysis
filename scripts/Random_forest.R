@@ -12,24 +12,11 @@
 
 # -- 1. Package management -----------------------------------
 
-required_pkgs <- c("caret", "Boruta", "randomForest", "dplyr", "tidyr")
-missing_pkgs  <- required_pkgs[!sapply(required_pkgs, requireNamespace, quietly = TRUE)]
-
-if (length(missing_pkgs) > 0) {
-  stop(
-    "The following packages are missing. Install them with install.packages():\n  ",
-    paste(missing_pkgs, collapse = ", ")
-  )
-}
-
-suppressPackageStartupMessages({
-  library(caret)
-  library(Boruta)
-  library(randomForest)
-  library(dplyr)
-  library(tidyr)
-})
-
+library(caret)
+library(Boruta)
+library(randomForest)
+library(dplyr)
+library(tidyr)
 
 # -- 2. User settings ----------------------------------------
 
